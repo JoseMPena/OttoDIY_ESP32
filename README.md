@@ -22,3 +22,4 @@ It may also be possible (and easier) to use an [Arduino Nano ESP32](https://stor
 The external BLE Bluetooth module is not required as the ESP32 has a built-in Bluetooth module.
 
 Before loading the sketch, you will need to update it with the pin numbers your peripherals are connected to and either set your WiFi connection credentials or disable WiFi by commenting out `#define ENABLE_WIFI`.
+/Users/jose.pena/Code/Arduino/libraries/NonBlockingRTTTL/src/NonBlockingRtttl.cpp
