@@ -4,417 +4,514 @@
 //-- José M. Peña --//
 //-----------------------------------------------------------------
 
-#define BLESERIAL_USE_NIMBLE true
 #include <Arduino.h>
 #include <Wire.h>
 #include <vector>
 #include <Otto.h>
-#include <anyrtttl.h>
-// #include <BLESerial.h>
-#include <SerialCommand.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
 
-#define ECHO 0          // ultrasonic sensor echo pin
-#define TRIGGER 1       // ultrasonic sensor trigger pin
-#define LeftLeg 2       // left leg pin
-#define RightLeg 3      // right leg pin
-#define LeftFoot 4      // left foot pin
-#define RightFoot 5     // right foot pin
-#define Buzzer 6        // buzzer pin
-#define ActionButton 7  // *rolls eyes*
-#define PlayButton 8    // hmm idk... play button pin??
+// --- Pin Definitions ---
+#define ECHO_PIN 0
+#define TRIGGER_PIN 1
+#define LEFT_LEG_PIN 2
+#define RIGHT_LEG_PIN 3
+#define LEFT_FOOT_PIN 4
+#define RIGHT_FOOT_PIN 5
+#define BUZZER_PIN 6
+#define ACTION_BUTTON_PIN 7
+#define BLUETOOTH_LED_PIN 8
+#define PLAY_BUTTON_PIN 21
 
+// --- Nordic UART Service (NUS) UUIDs ---
+// The Otto app is most likely looking for these standard UUIDs
+#define SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+const char* deviceName = "Otto DIY - Jose";  // <<------------ CHANGE TO EACH KID'S NAME
+
+// --- Global Objects ---
 Otto Otto;
 
-int T = 1000;
+// --- Otto Movement Parameters ---
+const int OTTO_MOVE_SPEED = 1000;
+const int OTTO_SMALL_STEP_PERIOD = 1500;
+const int OTTO_STANDARD_HEIGHT = 20;
+const int OTTO_TURN_STEPS = 2;
 
+// --- Mode Management ---
 enum Mode {
   MODE_APP = 0,
   MODE_AVOID,
-  MODE_FORCE,
+  MODE_DETECT,
   MODE_DANCE,
   MODE_COUNT
 };
-
 Mode currentMode = MODE_APP;
-
-int currentSongIndex = 0;
+const char* MODE_NAMES[] = { "APP", "AVOID", "DETECT", "DANCE" };
 int currentDanceIndex = 0;
 
-volatile int toneFrequency = 0;
-hw_timer_t* toneTimer = NULL;
+// --- Sensor & Button State ---
+unsigned long lastUltraSoundTime = 0;
+const unsigned long ULTRASOUND_INTERVAL = 100;
+long currentDistance = -1;
+const int MAX_DISTANCE_CM = 200;
+const unsigned long ULTRASOUND_TIMEOUT_US = MAX_DISTANCE_CM * 58 * 2;
 
-// --- Forward declarations for new/modified functions ---
+bool lastActionButtonReading = HIGH;
+bool lastPlayButtonReading = HIGH;
+unsigned long lastActionButtonChangeTime = 0;
+unsigned long lastPlayButtonChangeTime = 0;
+unsigned long lastActionButtonTriggerTime = 0;
+unsigned long lastPlayButtonTriggerTime = 0;
+const unsigned long DEBOUNCE_DELAY_MS = 50;
+const unsigned long BUTTON_COOLDOWN_MS = 500;
+unsigned long lastBlinkTime = 0;
+bool ledState = false;
+
+// --- Non-Blocking State Management ---
+bool modeActionInProgress = false;
+enum class AvoidState { AVOID_IDLE,
+                        AVOID_BACKWARD,
+                        AVOID_TURN,
+                        AVOID_FORWARD };
+AvoidState currentAvoidState = AvoidState::AVOID_IDLE;
+enum class DetectState { REACTING_IDLE,
+                         REACTING_SURPRISE,
+                         REACTING_GESTURE,
+                         REACTING_FLAP,
+                         REACTING_SHAKE_LEG,
+                         REACTING_COOLDOWN };
+DetectState currentDetectState = DetectState::REACTING_IDLE;
+unsigned long detectActionCompletionTime = 0;
+const unsigned long DETECT_COOLDOWN_MS = 3000;
+
+// --- Forward Declarations ---
 void cycleToNextMode();
-long ultrasound();
-void appMode();
-void detectModeLoop();
-void startDetectMode();
-void stopDetectMode();
+void readUltrasound();
+void appModeLoop();
 void avoidModeLoop();
-void forceModeLoop();
 void danceModeLoop();
-
-// --- individual dances and song/dance execution ---
+void detectModeLoop();
 void executeCurrentDance();
 void playNextDance();
-void danceRoutine1();
-void danceRoutine2();
-void danceRoutine3();
-void danceRoutine4();
-void danceRoutine5();
+void danceRoutine1(), danceRoutine2(), danceRoutine3(), danceRoutine4(), danceRoutine5();
+void calibrationCommand();
+void setupBLE();
 
-void executeCurrentSong();
-void playNextSong();
-void stopCurrentSong();
+void handleMove(int conde, int speed);
+void handleGesture(int code);
+void handleSong(int code);
 
-void setup() {
-  delay(1000);
-  Serial.begin(115200);
-  delay(500);
+BLECharacteristic* pTxCharacteristic;
+BLECharacteristic* pRxCharacteristic;
+bool deviceConnected = false;
 
-  Serial.println("Boot OK");
-  Otto.init(LeftLeg, RightLeg, LeftFoot, RightFoot, true, Buzzer);
+class CommandCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) {
+    String rxValue = pCharacteristic->getValue().c_str();
+    ;
 
-  pinMode(ActionButton, INPUT_PULLUP);
-  pinMode(PlayButton, INPUT_PULLUP);
-  pinMode(ECHO, INPUT);
-  pinMode(TRIGGER, OUTPUT);
-  pinMode(Buzzer, OUTPUT);
+    if (rxValue.length() > 0) {
+      Serial.print("Received: ");
+      Serial.println(rxValue);
 
-  Otto.sing(S_cuddly);
-  Serial.println("Robot Ready!");
-  Serial.print("Current Mode: ");
-  Serial.println(currentMode);
-}
+      // --- MANUAL PARSING LOGIC ---
+      char commandType = rxValue.charAt(0);
 
-// --- DEBOUNCING VARIABLES ---
-// Variables to track the last actual reading of the button to detect changes
-bool lastActionButtonReading = HIGH;  // Assume pullup, so HIGH initially
-bool lastPlayButtonReading = HIGH;
+      int firstSpace = rxValue.indexOf(' ');
+      if (firstSpace == -1) {
+        Serial.println("ERR: Invalid format. No space found.");
+        return;  // Exit if format is wrong
+      }
 
-// Variables to store the time when the button input last changed state
-long lastActionButtonChangeTime = 0;
-long lastPlayButtonChangeTime = 0;
+      // Find the second space to see if a second parameter exists
+      int secondSpace = rxValue.indexOf(' ', firstSpace + 1);
 
-// Variables to store the time when an action was last triggered (for cooldown)
-long last_action_button_trigger_time = 0;
-long last_play_button_trigger_time = 0;
+      int code = 0;
+      int param2 = 1000;  // Default speed for moves
 
-const long DEBOUNCE_DELAY_MS = 50;     // Time to wait for button input to stabilize
-const long ACTION_COOLDOWN_MS = 1000;  // Time to wait between successive actions (e.g., mode changes)
+      if (secondSpace != -1) {  // Two parameters found, e.g., "M 1 500"
+        code = rxValue.substring(firstSpace + 1, secondSpace).toInt();
+        param2 = rxValue.substring(secondSpace + 1).toInt();
+      } else {  // Only one parameter found, e.g., "H 19" or "M 0"
+        code = rxValue.substring(firstSpace + 1).toInt();
+      }
 
-bool appModeEnabled = false;
+      // --- DISPATCH COMMAND ---
+      switch (commandType) {
+        case 'M':
+          handleMove(code, param2);  // param2 is the speed
+          break;
+        case 'H':
+          handleGesture(code);
+          break;
+        case 'K':
+          handleSong(code);
+          break;
+        default:
+          Serial.println("ERR: Unknown command type.");
+          break;
+      }
+    }
+  }
+};
 
-void loop() {
-  // --- Action Button Debounce and Cooldown Logic ---
-  int currentActionButtonReading = digitalRead(ActionButton);
-
-  // Detect a change in the button's physical reading
-  if (currentActionButtonReading != lastActionButtonReading) {
-    lastActionButtonChangeTime = millis();  // Reset the debounce timer
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    Serial.println("BLE client connected.");
+    deviceConnected = true;
+    Otto.sing(S_connection);
   }
 
-  // If the reading has been stable for DEBOUNCE_DELAY_MS
-  if ((millis() - lastActionButtonChangeTime) > DEBOUNCE_DELAY_MS) {
-    // If the button is currently pressed (LOW after pullup) and has been stable
-    if (currentActionButtonReading == LOW) {
-      // And enough time has passed since the last action trigger (cooldown)
-      if ((millis() - last_action_button_trigger_time) > ACTION_COOLDOWN_MS) {
-        last_action_button_trigger_time = millis();  // Reset cooldown timer
+  void onDisconnect(BLEServer* pServer) {
+    Serial.println("BLE Client Disconnected");
+    deviceConnected = false;
+    digitalWrite(BLUETOOTH_LED_PIN, HIGH);
+    Otto.sing(S_disconnection);
+    // Restart advertising
+    BLEDevice::startAdvertising();
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("Booting Otto Robot...");
+
+  Otto.init(LEFT_LEG_PIN, RIGHT_LEG_PIN, LEFT_FOOT_PIN, RIGHT_FOOT_PIN, true, BUZZER_PIN);
+
+  pinMode(ACTION_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(PLAY_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(TRIGGER_PIN, OUTPUT);
+  pinMode(BLUETOOTH_LED_PIN, OUTPUT);
+  digitalWrite(BLUETOOTH_LED_PIN, HIGH);
+
+  setupBLE();  // Setup BLE commands and initialize BLE
+
+  Otto.sing(S_connection);
+  Otto.home();
+  Serial.println("Robot Ready!");
+  Serial.print("Current Mode: ");
+  Serial.println(MODE_NAMES[currentMode]);
+}
+
+void setupBLE() {
+  Serial.println("Enter BLE Setup");
+  BLEDevice::init(deviceName);
+
+  BLEServer* pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  BLEService* pService = pServer->createService(SERVICE_UUID);
+
+  pTxCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID_TX,
+    BLECharacteristic::PROPERTY_NOTIFY);
+  pTxCharacteristic->addDescriptor(new BLE2902());
+
+  pRxCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID_RX,
+    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  pRxCharacteristic->setCallbacks(new CommandCallbacks());
+
+  pService->start();
+
+  /// Start advertising using the exact method from your working sketch
+  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);  // Setting to true is fine, name will be added automatically
+  // The min/max preferred connection interval settings for iOS
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMaxPreferred(0x12);
+  BLEDevice::startAdvertising();
+
+  Serial.println("Advertising started, waiting for connection...");
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+
+  if (currentTime - lastBlinkTime >= 500) {  // 500ms blink interval
+    ledState = !ledState;
+    digitalWrite(BLUETOOTH_LED_PIN, ledState);
+    lastBlinkTime = currentTime;
+  } else {
+    digitalWrite(BLUETOOTH_LED_PIN, HIGH);
+  }
+
+  // --- Button Handling ---
+  int currentActionButtonReading = digitalRead(ACTION_BUTTON_PIN);
+  if (currentActionButtonReading != lastActionButtonReading) {
+    lastActionButtonChangeTime = currentTime;
+  }
+  if ((currentTime - lastActionButtonChangeTime) > DEBOUNCE_DELAY_MS) {
+    if (currentActionButtonReading == LOW && lastActionButtonReading == HIGH) {
+      if ((currentTime - lastActionButtonTriggerTime) > BUTTON_COOLDOWN_MS) {
+        lastActionButtonTriggerTime = currentTime;
         Otto.sing(S_buttonPushed);
         cycleToNextMode();
       }
     }
   }
+  lastActionButtonReading = currentActionButtonReading;
 
-  lastActionButtonReading = currentActionButtonReading;  // Save current reading for next iteration
-
-  // --- Play Button Debounce and Cooldown Logic ---
-  int currentPlayButtonReading = digitalRead(PlayButton);
-
-  // Detect a change in the button's physical reading
+  int currentPlayButtonReading = digitalRead(PLAY_BUTTON_PIN);
   if (currentPlayButtonReading != lastPlayButtonReading) {
-    lastPlayButtonChangeTime = millis();  // Reset the debounce timer
+    lastPlayButtonChangeTime = currentTime;
   }
-
-  // If the reading has been stable for DEBOUNCE_DELAY_MS
-  if ((millis() - lastPlayButtonChangeTime) > DEBOUNCE_DELAY_MS) {
-    // If the button is currently pressed (LOW after pullup) and has been stable
-    if (currentPlayButtonReading == LOW) {
-      // And enough time has passed since the last action trigger (cooldown)
-      if ((millis() - last_play_button_trigger_time) > ACTION_COOLDOWN_MS) {
-        last_play_button_trigger_time = millis();  // Reset cooldown timer
-
+  if ((currentTime - lastPlayButtonChangeTime) > DEBOUNCE_DELAY_MS) {
+    if (currentPlayButtonReading == LOW && lastPlayButtonReading == HIGH) {
+      if ((currentTime - lastPlayButtonTriggerTime) > BUTTON_COOLDOWN_MS) {
+        lastPlayButtonTriggerTime = currentTime;
         if (currentMode == MODE_DANCE) {
-            playNextDance();
+          playNextDance();
         } else {
-            Serial.println("Play button has no action in this mode.");
-            Otto.sing(S_OhOoh);  // Provide feedback that Play button is not active
+          Otto.sing(S_OhOoh);
         }
       }
     }
   }
-  lastPlayButtonReading = currentPlayButtonReading;  // Save current reading for next iteration
+  lastPlayButtonReading = currentPlayButtonReading;
 
+  // --- Ultrasound Reading ---
+  if (currentTime - lastUltraSoundTime > ULTRASOUND_INTERVAL) {
+    lastUltraSoundTime = currentTime;
+    readUltrasound();
+  }
 
-  // --- Continuous Mode Execution (Non-blocking parts of modes) ---
+  // --- Mode Logic ---
   switch (currentMode) {
-    case MODE_APP:
-      if (appModeEnabled) {
-        appMode();
+    case MODE_APP: appModeLoop(); break;
+    case MODE_AVOID: avoidModeLoop(); break;
+    case MODE_DANCE: danceModeLoop(); break;
+    case MODE_DETECT: detectModeLoop(); break;
+  }
+}
+
+void cycleToNextMode() {
+  currentMode = (Mode)((currentMode + 1) % MODE_COUNT);
+  Otto.home();
+  modeActionInProgress = false;
+  currentAvoidState = AvoidState::AVOID_IDLE;
+  currentDetectState = DetectState::REACTING_IDLE;
+  Serial.print("Switched to mode: ");
+  Serial.println(MODE_NAMES[currentMode]);
+  Otto.sing(S_happy);
+  switch (currentMode) {
+    case MODE_AVOID: currentAvoidState = AvoidState::AVOID_FORWARD; break;
+    case MODE_DANCE:
+      currentDanceIndex = 0;
+      executeCurrentDance();
+      break;
+    default: break;
+  }
+}
+
+void readUltrasound() {
+  digitalWrite(TRIGGER_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIGGER_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIGGER_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, ULTRASOUND_TIMEOUT_US);
+  currentDistance = (duration > 0) ? (duration / 58) : -1;
+}
+
+void appModeLoop() {
+  // Primarily driven by BLE commands. Could have idle animations.
+}
+
+void danceModeLoop() {
+  // Dances are blocking, so this loop is mostly unused.
+}
+
+void detectModeLoop() {
+  unsigned long currentTime = millis();
+  switch (currentDetectState) {
+    case DetectState::REACTING_IDLE:
+      if (currentDistance > 0 && currentDistance < 15) {
+        currentDetectState = DetectState::REACTING_GESTURE;
+        Otto.sing(S_surprise);
       }
       break;
-    case MODE_AVOID:
-      avoidModeLoop();
-      break;
-    case MODE_DANCE:
-      // No continuous loop for dance, actions triggered by buttons
-      break;
-  }
-}
-
-// This function is called when the ActionButton is pressed.
-// It handles transitioning to the next mode and initiating its entry actions.
-void cycleToNextMode() {
-  // Stop any ongoing actions or cleanup from the previous mode
-  // For now, Otto.home() is a good general cleanup
-  Otto.home();
-  stopCurrentSong();
-  stopDetectMode();  // Ensure detect mode's flags are reset
-
-  // Cycle to the next mode
-  currentMode = (Mode)((currentMode + 1) % MODE_COUNT);
-
-  Serial.print("Switched to mode: ");
-  Serial.println(currentMode);
-
-  // Perform entry actions for the new mode
-  switch (currentMode) {
-    case MODE_APP:
-      Serial.println("App mode active (waiting for BLE commands)");
-      appModeEnabled = false;  // Reset appModeEnabled, it will be set when BLE is active.
-      break;
-    case MODE_DETECT:
-      Serial.println("Entering Detect Mode");
-      startDetectMode();  // Setup for continuous detection loop
-      break;
-    case MODE_SONG:
-      Serial.println("Entering Song Mode");
-      currentSongIndex = 0;  // Reset song index for the new mode entry
-      executeCurrentSong();  // Play the first song
-      break;
-    case MODE_AVOID:
-      Serial.println("Entering Avoid Mode");
-      break;
-    case MODE_FORCE:
-      Serial.println("Entering Force Mode");
-      break;
-    case MODE_DANCE:
-      Serial.println("Entering Dance Mode");
-      currentDanceIndex = 0;  // Reset dance index for the new mode entry
-      executeCurrentDance();  // Play the first dance routine
-      break;
-  }
-}
-
-long ultrasound() {
-  long duration, distance;
-  digitalWrite(TRIGGER, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIGGER, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIGGER, LOW);
-  duration = pulseIn(ECHO, HIGH);
-  distance = duration / 58;
-  return distance;
-}
-
-void appMode() {
-  // This will be filled later with BLE logic
-  // For now, it just prints and sets a flag that will be managed by BLE connection
-  // Serial.println("Modo App activado"); // Avoid printing repeatedly in loop
-  // appModeEnabled = true; // This flag should be set by BLE connection status
-}
-
-bool detectModeActive = false;
-unsigned long lastDetectActionTime = 0;
-const unsigned long detectInterval = 1000;
-void startDetectMode() {
-  detectModeActive = true;
-  lastDetectActionTime = millis();
-}
-void stopDetectMode() {
-  detectModeActive = false;
-  Otto.home();
-}
-void detectModeLoop() {
-  if (!detectModeActive) return;
-
-  unsigned long now = millis();
-  if ((now - lastDetectActionTime > detectInterval)) {
-    int distance = ultrasound();
-    if (distance > 0 && distance < 15) {
-      Serial.print("Object detected at: ");
-      Serial.print(distance);
-      Serial.println(" cm");
-      Otto.sing(S_surprise);
+    case DetectState::REACTING_GESTURE:
       Otto.playGesture(OttoConfused);
-      Otto.flapping(2, 1000, 15, 1);
-      Otto.shakeLeg(1, 2000, 1);
-      Otto.home();                 // This will block the loop for the duration of these movements
-      lastDetectActionTime = now;  // Reset timer after action
-    }
+      currentDetectState = DetectState::REACTING_FLAP;
+      break;
+    case DetectState::REACTING_FLAP:
+      Otto.flapping(1, OTTO_SMALL_STEP_PERIOD, OTTO_STANDARD_HEIGHT, 1);
+      currentDetectState = DetectState::REACTING_SHAKE_LEG;
+      break;
+    case DetectState::REACTING_SHAKE_LEG:
+      Otto.shakeLeg(1, OTTO_SMALL_STEP_PERIOD, 1);
+      Otto.home();
+      detectActionCompletionTime = currentTime;
+      currentDetectState = DetectState::REACTING_COOLDOWN;
+      break;
+    case DetectState::REACTING_COOLDOWN:
+      if (currentTime - detectActionCompletionTime > DETECT_COOLDOWN_MS) {
+        currentDetectState = DetectState::REACTING_IDLE;
+      }
+      break;
   }
-}
-
-std::vector<char*> songs = {
-  "Super Mario:d=4,o=5,b=100:16e6,16e6,32p,8e6,16c6,8e6,8g6,8p,8g,8p,8c6,16p,8g,16p,8e,16p,8a,8b,16a#,8a,16g.,16e6,16g6,8a6,16f6,8g6,8e6,16c6,16d6,8b,16p,8c6,16p,8g,16p,8e,16p,8a,8b,16a#,8a,16g.,16e6,16g6,8a6,16f6,8g6,8e6,16c6,16d6,8b,8p,16g6,16f#6,16f6,16d#6,16p,16e6,16p,16g#,16a,16c6,16p,16a,16c6,16d6,8p,16g6,16f#6,16f6,16d#6,16p,16e6,16p,16c7,16p,16c7,16c7,p,16g6,16f#6,16f6,16d#6,16p,16e6,16p,16g#,16a,16c6,16p,16a,16c6,16d6,8p,16d#6,8p,16d6,8p,16c6",
-  "The Simpsons:d=4,o=5,b=160:c.6,e6,f#6,8a6,g.6,e6,c6,8a,8f#,8f#,8f#,2g,8p,8p,8f#,8f#,8f#,8g,a#.,8c6,8c6,8c6,c6",
-  "Macarena:d=4,o=5,b=180:f,8f,8f,f,8f,8f,8f,8f,8f,8f,8f,8a,8c,8c,f,8f,8f,f,8f,8f,8f,8f,8f,8f,8d,8c,p,f,8f,8f,f,8f,8f,8f,8f,8f,8f,8f,8a,p,2c.6,a,8c6,8a,8f,p,2p",
-  "Titanic:d=4,o=5,b=125:8f,8g,2a.,16a#,16a,16g,16f,8g,2c.6,8a.,8c.6,2d.6,8c.6,8a.,1g,2p,f.,8f,f,f,e,2f,f,e,2f,g,2a,2g,f.,8f,f,f,e,2f,f,1c",
-  "20thCenFox:d=16,o=5,b=140:b,8p,b,b,2b,p,c6,32p,b,32p,c6,32p,b,32p,c6,32p,b,8p,b,b,b,32p,b,32p,b,32p,b,32p,b,32p,b,32p,b,32p,g#,32p,a,32p,b,8p,b,b,2b,4p,8e,8g#,8b,1c#6,8f#,8a,8c#6,1e6,8a,8c#6,8e6,1e6,8b,8g#,8a,2b",
-  "TakeOnMe:d=4,o=4,b=160:8f#5,8f#5,8f#5,8d5,8p,8b,8p,8e5,8p,8e5,8p,8e5,8g#5,8g#5,8a5,8b5,8a5,8a5,8a5,8e5,8p,8d5,8p,8f#5,8p,8f#5,8p,8f#5,8e5,8e5,8f#5,8e5,8f#5,8f#5,8f#5,8d5,8p,8b,8p,8e5,8p,8e5,8p,8e5,8g#5,8g#5,8a5,8b5,8a5,8a5,8a5,8e5,8p,8d5,8p,8f#5,8p,8f#5,8p,8f#5,8e5,8e5",
-  "Imperial:d=4,o=5,b=112:8g,16p,8g,16p,8g,16p,16d#.,32p,32a#.,8g,16p,16d#.,32p,32a#.,g,8p,32p,8d6,16p,8d6,16p,8d6,16p,16d#.6,32p,32a#.,8f#,16p,16d#.,32p,32a#.,g,8p,32p,8g6,16p,16g.,32p,32g.,8g6,16p,16f#.6,32p,32f.6,32e.6,32d#.6,16e6,8p,16g#,32p,8c#6,16p,16c.6,32p,32b.,32a#.,32a.,16a#,8p,16d#,32p,8f#,16p,16d#.,32p,32g.,8a#,16p,16g.,32p,32a#.,d6,8p,32p,8g6,16p,16g.,32p,32g.,8g6,16p,16f#.6,32p,32f.6,32e.6,32d#.6,16e6,8p,16g#,32p,8c#6,16p,16c.6,32p,32b.,32a#.,32a.,16a#,8p,16d#,32p,8f#,16p,16d#.,32p,32g.,8g,16p,16d#.,32p,32a#.,g",
-  "StarWars:d=4,o=5,b=45:32p,32f#,32f#,32f#,8b.,8f#.6,32e6,32d#6,32c#6,8b.6,16f#.6,32e6,32d#6,32c#6,8b.6,16f#.6,32e6,32d#6,32e6,8c#.6,32f#,32f#,32f#,8b.,8f#.6,32e6,32d#6,32c#6,8b.6,16f#.6,32e6,32d#6,32c#6,8b.6,16f#.6,32e6,32d#6,32e6,8c#6",
-  "greenday:d=4,o=6,b=50:32b5,32a,16g,16g,16g,32g,32g,16d,16d,16d,32d,32d,16e,8e,c,32b5,32a,8g,16g,32g,16g.,16d,16d,16d,32d,32d,16e,8e,c,32b5,32a,16g,16g,16g,32g,32g,16d,16d,16d,32d,32d,16e,8e,8c.",
-  "KnightRider:d=4,o=5,b=125:16e,16p,16f,16e,16e,16p,16e,16e,16f,16e,16e,16e,16d#,16e,16e,16e,16e,16p,16f,16e,16e,16p,16f,16e,16f,16e,16e,16e,16d#,16e,16e,16e,16d,16p,16e,16d,16d,16p,16e,16d,16e,16d,16d,16d,16c,16d,16d,16d,16d,16p,16e,16d,16d,16p,16e,16d,16e,16d,16d,16d,16c,16d,16d,16d",
-  "VanessaMae:d=4,o=6,b=70:32c7,32b,16c7,32g,32p,32g,32p,32d#,32p,32d#,32p,32c,32p,32c,32p,32c7,32b,16c7,32g#,32p,32g#,32p,32f,32p,16f,32c,32p,32c,32p,32c7,32b,16c7,32g,32p,32g,32p,32d#,32p,32d#,32p,32c,32p,32c,32p,32g,32f,32d#,32d,32c,32d,32d#,32c,32d#,32f,16g,8p,16d7,32c7,32d7,32a#,32d7,32a,32d7,32g,16d7,32p,32d7,32p,32d7,32p,16d7,32c7,32d7,32a#,32d7,32a,32d7,32g,16d7,32p,32d7,32p,32d7,32p,32g,32f,32d#, 32d,32c,32d,32d#,32c,32d#,32d,8c",
-  "Birdy Song:o=5,d=16,b=100,b=100:g,g,a,a,e,e,8g,g,g,a,a,e,e,8g,g,g,a,a,c6,c6,8b,8b,8a,8g,8f,f,f,g,g,d,d,8f,f,f,g,g,d,d,8f,f,f,g,g,a,b,8c6,8a,8g,8e,4c",
-  "Mozart:o=5,d=16,b=125,b=125:16d#,c#,c,c#,8e,8p,f#,e,d#,e,8g#,8p,a,g#,g,g#,d#6,c#6,c6,c#6,d#6,c#6,c6,c#6,4e6,8c#6,8e6,32b,32c#6,d#6,8c#6,8b,8c#6,32b,32c#6,d#6,8c#6,8b,8c#6,32b,32c#6,d#6,8c#6,8b,8a#,4g#,d#,32c#,c,c#,8e,8p,f#,e,d#",
-  "Spiderman:o=6,d=4,b=200,b=200:c,8d#,g.,p,f#,8d#,c.,p,c,8d#,g,8g#,g,f#,8d#,c.,p,f,8g#,c7.,p,a#,8g#,f.,p,c,8d#,g.,p,f#,8d#,c,p,8g#,2g,p,8f#,f#,8d#,f,8d#,2c",
-  "Adams Family:o=5,d=8,b=160,b=160:c,4f,a,4f,c,4b4,2g,f,4e,g,4e,g4,4c,2f,c,4f,a,4f,c,4b4,2g,f,4e,c,4d,e,1f,c,d,e,f,1p,d,e,f#,g,1p,d,e,f#,g,4p,d,e,f#,g,4p,c,d,e,f",
-  "SuperMan:d=4,o=5,b=180:8g,8g,8g,c6,8c6,2g6,8p,8g6,8a.6,16g6,8f6,1g6,8p,8g,8g,8g,c6,8c6,2g6,8p,8g6,8a.6,16g6,8f6,8a6,2g.6,p,8c6,8c6,8c6,2b.6,g.6,8c6,8c6,8c6,2b.6,g.6,8c6,8c6,8c6,8b6,8a6,8b6,2c7,8c6,8c6,8c6,8c6,8c6,2c.6",
-  "Indiana Jones:d=4,o=5,b=250:e,8p,8f,8g,8p,1c6,8p.,d,8p,8e,1f,p.,g,8p,8a,8b,8p,1f6,p,a,8p,8b,2c6,2d6,2e6,e,8p,8f,8g,8p,1c6,p,d6,8p,8e6,1f.6,g,8p,8g,e.6,8p,d6,8p,8g,e.6,8p,d6,8p,8g,f.6,8p,e6,8p,8d6,2c6",
-  "Deep Purple-Smoke on the Water:o=4,d=4,b=112,b=112:c,d#,f.,c,d#,8f#,f,p,c,d#,f.,d#,c,2p,8p,c,d#,f.,c,d#,8f#,f,p,c,d#,f.,d#,c"
-};
-void executeCurrentSong() {
-  Serial.print("Playing Song: ");
-  Serial.println(currentSongIndex);
-  if (currentSongIndex < songs.size()) {
-    anyrtttl::nonblocking::begin(Buzzer, songs[currentSongIndex]);
-  }
-}
-
-void playNextSong() {
-  stopCurrentSong();
-  currentSongIndex = (currentSongIndex + 1) % songs.size();
-  executeCurrentSong();
-}
-
-void stopCurrentSong() {
-  anyrtttl::nonblocking::stop();
-  digitalWrite(Buzzer, LOW);
-  Serial.println("Song stopped.");
 }
 
 void avoidModeLoop() {
-  int distance = ultrasound();
-  if (distance > 0 && distance < 15) {
+  // NOTE: This mode is very blocking.
+  if (currentDistance > 0 && currentDistance < 15) {
     Otto.sing(S_surprise);
-    Otto.playGesture(OttoConfused);
-    Otto.walk(2, 1000, -1);  // This will block the loop for ~2 seconds
-    Otto.turn(3, 1000, 1);   // This will block the loop for ~3 seconds
-    delay(50);               // This will block the loop
+    Otto.walk(2, 1000, -1);
+    Otto.turn(4, 1000, 1);
   } else {
-    Otto.walk(1, 1000, 1);  // This will block the loop for ~1 second
+    Otto.walk(1, 1000, 1);
   }
 }
 
-void forceModeLoop() {
-  int distance = ultrasound();
-  if (distance > 0 && distance <= 10) {
-    Otto.walk(1, 1000, -1);  // Blocking
-  }
-  if (distance > 10 && distance < 15) {
-    Otto.home();  // Blocking
-  }
-  if (distance > 15 && distance < 30) {
-    Otto.walk(1, 1000, 1);  // Blocking
-  }
-  if (distance < 0 || distance > 30) {
-    Otto.home();  // Blocking
-  }
-}
-
-// --- DANCE MODE ---
-// Otto.home() should be called at the end of each routine.
-
-void danceRoutine1() {
-  Serial.println("Executing Dance Routine 1: Jitter & Moonwalker");
-  Otto.playGesture(OttoSuperHappy);
-  Otto.home();
-  Otto.jitter(10, 500, 40);  // Blocking
-  Otto.home();
-  Otto.moonwalker(3, 1000, 25, 1);   //LEFT Blocking!!
-  Otto.moonwalker(3, 1000, 25, -1);  //RIGHT Blocking!!
-  Otto.home();
-}
-
-void danceRoutine2() {
-  Serial.println("Executing Dance Routine 2: Ascending Turn & Tiptoe Swing");
-  Otto.playGesture(OttoVictory);
-  Otto.home();
-  Otto.ascendingTurn(2, 500, 50);  // Blocking
-  Otto.home();
-  Otto.tiptoeSwing(2, 1000, 30);  // Blocking
-  Otto.home();
-}
-
-void danceRoutine3() {
-  Serial.println("Executing Dance Routine 3: Flapping & Crusaito");
-  Otto.playGesture(OttoLove);
-  Otto.home();
-  Otto.flapping(2, 500, 40, 1);  // Blocking
-  Otto.home();
-  Otto.crusaito(2, 3000, 40, 1);  // Blocking
-  Otto.home();
-}
-
-void danceRoutine4() {
-  Serial.println("Executing Dance Routine 3: Jitter, Updown & Jump");
-  Otto.playGesture(OttoWave);
-  Otto.home();
-  Otto.jitter(2, 1000, 20);  //(small T)
-  Otto.home();
-  Otto.updown(2, 1500, 20);  // 20 = H "HEIGHT of movement"T
-  Otto.home();
-  Otto.jump(1, 500);  // It doesn't really jumpl ;P
-  Otto.home();
-}
-
-void danceRoutine5() {
-  Serial.println("Executing Dance Routine 4: Shake Leg & Disconnection");
-  Otto.playGesture(OttoMagic);
-  Otto.home();
-  Otto.shakeLeg(2, 1000, 1);  // Blocking
-  Otto.home();
-  Otto.swing(2, 1000, 20);
-  Otto.home();
-  Otto.sing(S_disconnection);  // Blocking
-  delay(500);                  // This specific delay might be fine here if it's the very end of a routine.
-}
-
-// --- Vector of function pointers for dance routines ---
-std::vector<void (*)()> danceRoutines = {
-  danceRoutine1,
-  danceRoutine2,
-  danceRoutine3,
-  danceRoutine4,
-  danceRoutine5
-};
+// --- Dance Routines & Execution ---
+std::vector<void (*)()> danceRoutines = { danceRoutine1, danceRoutine2, danceRoutine3, danceRoutine4, danceRoutine5 };
 
 void executeCurrentDance() {
   if (currentDanceIndex < danceRoutines.size()) {
-    Serial.print("Executing Dance Routine: ");
-    Serial.println(currentDanceIndex);
-    danceRoutines[currentDanceIndex]();  // Execute the specific routine
-  } else {
-    Serial.println("Invalid dance routine index.");
+    Otto.sing(S_happy);
+    modeActionInProgress = true;
+    danceRoutines[currentDanceIndex]();
+    Otto.home();
+    modeActionInProgress = false;
   }
 }
 
 void playNextDance() {
+  Otto.home();
   currentDanceIndex = (currentDanceIndex + 1) % danceRoutines.size();
   executeCurrentDance();
+}
+
+void danceRoutine1() {
+  Otto.playGesture(OttoSuperHappy);
+  Otto.jitter(4, 500, 20);
+  Otto.moonwalker(2, OTTO_MOVE_SPEED, 25, 1);
+  Otto.moonwalker(2, OTTO_MOVE_SPEED, 25, -1);
+  Otto.home();
+}
+
+void danceRoutine2() {
+  Otto.playGesture(OttoVictory);
+  Otto.ascendingTurn(1, 500, 30);
+  Otto.tiptoeSwing(1, OTTO_MOVE_SPEED, 30);
+  Otto.home();
+}
+void danceRoutine3() {
+  Otto.playGesture(OttoLove);
+  Otto.flapping(1, 500, 30, 1);
+  Otto.crusaito(1, 2000, 30, 1);
+  Otto.home();
+}
+void danceRoutine4() {
+  Otto.playGesture(OttoWave);
+  Otto.jitter(2, 1000, 20);
+  Otto.updown(1, OTTO_SMALL_STEP_PERIOD, OTTO_STANDARD_HEIGHT);
+  Otto.jump(1, 500);
+  Otto.home();
+}
+void danceRoutine5() {
+  Otto.playGesture(OttoMagic);
+  Otto.shakeLeg(1, OTTO_MOVE_SPEED, 1);
+  Otto.swing(1, OTTO_MOVE_SPEED, 20);
+  Otto.sing(S_disconnection);
+  Otto.home();
+}
+
+// --- Command Callback Implementations ---
+void handleMove(int code, int speed) {
+  const int steps = 1;
+  Serial.printf("Handling Move: Code=%d, Speed=%d\n", code, speed);
+
+  switch (code) {
+    case 1: Otto.walk(steps, speed, 1); break;   // walk forward
+    case 2: Otto.walk(steps, speed, -1); break;  // walk backwards
+    case 3: Otto.turn(steps, speed, 1); break;   // turn left
+    case 4: Otto.turn(steps, speed, -1); break;  // turn right
+    case 19: Otto.updown(1, 1000, 20); break;
+    case 8: Otto.tiptoeSwing(2, 1000, 30); break;
+    case 14: Otto.jitter(4, 500, 20); break;
+    case 20: Otto.ascendingTurn(2, 1000, 50); break;
+    case 5: Otto.jump(1, 500); break;
+
+    case 13: Otto.swing(2, 1000, 20); break;
+    case 7: Otto.crusaito(2, 1000, 20, 1); break;
+    case 17: Otto.flapping(2, 1000, 20, -1); break;
+    case 15: Otto.bend(1, 500, -1); break;
+    case 10: Otto.shakeLeg(2, 1000, -1); break;
+
+    case 12:
+      Otto.moonwalker(3, 1000, 25, 1);
+      Otto.moonwalker(3, 1000, 25, -1);
+      break;
+    case 6: Otto.crusaito(2, 1000, 20, -1); break;
+    case 18: Otto.flapping(2, 1000, 20, 1); break;
+    case 16: Otto.bend(1, 500, 1); break;
+    case 9: Otto.shakeLeg(2, 1000, 1); break;
+
+    case 0: Otto.home(); break;  // Stop
+    default:
+      // If the move code is not 1-4 or 0, maybe it's a gesture code sent with 'M'?
+      handleGesture(code);
+      break;
+  }
+}
+
+void handleGesture(int code) {
+  Serial.printf("Handling Gesture: Code=%d\n", code);
+
+  switch (code) {
+    case 16: Otto.sing(S_mode1); break;
+    case 17: Otto.sing(S_mode2); break;
+    case 18: Otto.sing(S_mode3); break;
+    case 4: Otto.sing(S_OhOoh); break;
+    case 19: Otto.sing(S_buttonPushed); break;
+
+    case 10: Otto.sing(S_happy_short); break;
+    case 8: Otto.sing(S_happy); break;
+    case 9: Otto.sing(S_superHappy); break;
+    case 11: Otto.sing(S_sad); break;
+    case 7: Otto.sing(S_sleeping); break;
+
+    case 3: Otto.sing(S_OhOoh2); break;
+    case 2: Otto.sing(S_surprise); break;
+    case 12: Otto.sing(S_confused); break;
+    case 15: Otto.sing(S_fart1); break;
+    case 6: Otto.sing(S_cuddly); break;
+    default:
+      Serial.println("Unknown gesture code.");
+      Otto.home();
+      break;
+  }
+}
+
+void handleSong(int code) {
+  Serial.printf("Handling Song: Code=%d\n", code);
+
+  switch (code) {
+    case 1: Otto.playGesture(OttoHappy); break;
+    case 2: Otto.playGesture(OttoSuperHappy); break;
+    case 7: Otto.playGesture(OttoLove); break;
+    case 3: Otto.playGesture(OttoSad); break;
+    case 13: Otto.playGesture(OttoFail); break;
+
+    case 6: Otto.playGesture(OttoConfused); break;
+    case 5: Otto.playGesture(OttoVictory); break;
+    case 9: Otto.playGesture(OttoFretful); break;
+    case 8: Otto.playGesture(OttoAngry); break;
+    case 4: Otto.playGesture(OttoSleeping); break;
+
+    case 10: Otto.playGesture(OttoWave); break;
+    case 12: Otto.playGesture(OttoMagic); break;
+    case 11: Otto.playGesture(OttoFart); break;
+  }
 }
