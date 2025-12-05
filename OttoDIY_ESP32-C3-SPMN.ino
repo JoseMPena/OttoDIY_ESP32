@@ -5,6 +5,7 @@
 //-----------------------------------------------------------------
 
 #include <Arduino.h>
+#include <anyrtttl.h>
 #include <Wire.h>
 #include <vector>
 #include <Otto.h>
@@ -12,27 +13,29 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
-
+#include <esp_sleep.h>
+#include <driver/rtc_io.h>
+#include <EEPROM.h>
 
 // --- Pin Definitions ---
-#define ECHO_PIN 0
-#define TRIGGER_PIN 1
-#define LEFT_LEG_PIN 2
-#define RIGHT_LEG_PIN 3
-#define LEFT_FOOT_PIN 4
-#define RIGHT_FOOT_PIN 5
-#define BUZZER_PIN 6
-#define ACTION_BUTTON_PIN 7
+#define TRIGGER_PIN 0
+#define ECHO_PIN 1
+#define BUZZER_PIN 2
+#define ACTION_BUTTON_PIN 3
+#define WAKEUP_PIN 4
+#define LEFT_LEG_PIN 5
+#define RIGHT_LEG_PIN 6
 #define BLUETOOTH_LED_PIN 8
-#define PLAY_BUTTON_PIN 21
+#define PLAY_BUTTON_PIN 9
+#define LEFT_FOOT_PIN 20
+#define RIGHT_FOOT_PIN 21
 
 // --- Nordic UART Service (NUS) UUIDs ---
-// The Otto app is most likely looking for these standard UUIDs
 #define SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
-const char* deviceName = "Otto DIY - Jose";  // <<------------ CHANGE TO EACH KID'S NAME
+const char* deviceName = "Otto - Berta";  // <<------------ NAME HERE
 
 // --- Global Objects ---
 Otto Otto;
@@ -106,6 +109,8 @@ void setupBLE();
 void handleMove(int conde, int speed);
 void handleGesture(int code);
 void handleSong(int code);
+void executeSong(int index);
+void stopCurrentSong();
 
 BLECharacteristic* pTxCharacteristic;
 BLECharacteristic* pRxCharacteristic;
@@ -171,26 +176,39 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onDisconnect(BLEServer* pServer) {
     Serial.println("BLE Client Disconnected");
     deviceConnected = false;
-    digitalWrite(BLUETOOTH_LED_PIN, HIGH);
     Otto.sing(S_disconnection);
     // Restart advertising
     BLEDevice::startAdvertising();
   }
 };
 
+// -- Calibration Variables
+double angle_rad = PI / 180.0;
+double angle_deg = 180.0 / PI;
+// === Servo trims (from EEPROM) ===
+float YL = 0;
+float YR = 0;
+float RL = 0;
+float RR = 0;
+
 void setup() {
-  Serial.begin(115200);
-  delay(100);
-  Serial.println("Booting Otto Robot...");
-
-  Otto.init(LEFT_LEG_PIN, RIGHT_LEG_PIN, LEFT_FOOT_PIN, RIGHT_FOOT_PIN, true, BUZZER_PIN);
-
   pinMode(ACTION_BUTTON_PIN, INPUT_PULLUP);
   pinMode(PLAY_BUTTON_PIN, INPUT_PULLUP);
   pinMode(ECHO_PIN, INPUT);
   pinMode(TRIGGER_PIN, OUTPUT);
   pinMode(BLUETOOTH_LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(WAKEUP_PIN, INPUT_PULLDOWN);
   digitalWrite(BLUETOOTH_LED_PIN, HIGH);
+
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("Booting Otto Robot...");
+  
+  // Allow GPIO to stabilize
+  delay(50);
+
+  Otto.init(LEFT_LEG_PIN, RIGHT_LEG_PIN, LEFT_FOOT_PIN, RIGHT_FOOT_PIN, true, BUZZER_PIN);
 
   setupBLE();  // Setup BLE commands and initialize BLE
 
@@ -199,6 +217,10 @@ void setup() {
   Serial.println("Robot Ready!");
   Serial.print("Current Mode: ");
   Serial.println(MODE_NAMES[currentMode]);
+
+  esp_deep_sleep_enable_gpio_wakeup(1 << WAKEUP_PIN, ESP_GPIO_WAKEUP_GPIO_HIGH);
+
+  setupCalibration();
 }
 
 void setupBLE() {
@@ -222,7 +244,6 @@ void setupBLE() {
 
   pService->start();
 
-  /// Start advertising using the exact method from your working sketch
   BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->setScanResponse(true);  // Setting to true is fine, name will be added automatically
@@ -237,12 +258,23 @@ void setupBLE() {
 void loop() {
   unsigned long currentTime = millis();
 
-  if (currentTime - lastBlinkTime >= 500) {  // 500ms blink interval
-    ledState = !ledState;
-    digitalWrite(BLUETOOTH_LED_PIN, ledState);
-    lastBlinkTime = currentTime;
+  int wakeUpPinStatus = digitalRead(WAKEUP_PIN);
+  if (wakeUpPinStatus == LOW) {
+    Serial.println("Switch is OFF, going to Deep Sleep");
+    esp_deep_sleep_start();
+  }
+
+  // LED control based on bluetooth connection status
+  if (deviceConnected) {
+    // Connected to bluetooth - LED stays on (LOW due to inverse logic)
+    digitalWrite(BLUETOOTH_LED_PIN, LOW);
   } else {
-    digitalWrite(BLUETOOTH_LED_PIN, HIGH);
+    // Not connected - LED blinks every 500ms
+    if (currentTime - lastBlinkTime >= 500) {
+      ledState = !ledState;
+      digitalWrite(BLUETOOTH_LED_PIN, ledState);
+      lastBlinkTime = currentTime;
+    }
   }
 
   // --- Button Handling ---
@@ -251,7 +283,7 @@ void loop() {
     lastActionButtonChangeTime = currentTime;
   }
   if ((currentTime - lastActionButtonChangeTime) > DEBOUNCE_DELAY_MS) {
-    if (currentActionButtonReading == LOW && lastActionButtonReading == HIGH) {
+    if (currentActionButtonReading == LOW) {
       if ((currentTime - lastActionButtonTriggerTime) > BUTTON_COOLDOWN_MS) {
         lastActionButtonTriggerTime = currentTime;
         Otto.sing(S_buttonPushed);
@@ -266,7 +298,7 @@ void loop() {
     lastPlayButtonChangeTime = currentTime;
   }
   if ((currentTime - lastPlayButtonChangeTime) > DEBOUNCE_DELAY_MS) {
-    if (currentPlayButtonReading == LOW && lastPlayButtonReading == HIGH) {
+    if (currentPlayButtonReading == LOW) {
       if ((currentTime - lastPlayButtonTriggerTime) > BUTTON_COOLDOWN_MS) {
         lastPlayButtonTriggerTime = currentTime;
         if (currentMode == MODE_DANCE) {
@@ -292,6 +324,8 @@ void loop() {
     case MODE_DANCE: danceModeLoop(); break;
     case MODE_DETECT: detectModeLoop(); break;
   }
+
+  calibrationLoop();
 }
 
 void cycleToNextMode() {
@@ -306,8 +340,10 @@ void cycleToNextMode() {
   switch (currentMode) {
     case MODE_AVOID: currentAvoidState = AvoidState::AVOID_FORWARD; break;
     case MODE_DANCE:
+      Otto.home();
       currentDanceIndex = 0;
       executeCurrentDance();
+      Otto.home();
       break;
     default: break;
   }
@@ -325,6 +361,7 @@ void readUltrasound() {
 
 void appModeLoop() {
   // Primarily driven by BLE commands. Could have idle animations.
+  anyrtttl::nonblocking::play();
 }
 
 void danceModeLoop() {
@@ -343,10 +380,12 @@ void detectModeLoop() {
     case DetectState::REACTING_GESTURE:
       Otto.playGesture(OttoConfused);
       currentDetectState = DetectState::REACTING_FLAP;
+      Otto.home();
       break;
     case DetectState::REACTING_FLAP:
       Otto.flapping(1, OTTO_SMALL_STEP_PERIOD, OTTO_STANDARD_HEIGHT, 1);
       currentDetectState = DetectState::REACTING_SHAKE_LEG;
+      Otto.home();
       break;
     case DetectState::REACTING_SHAKE_LEG:
       Otto.shakeLeg(1, OTTO_SMALL_STEP_PERIOD, 1);
@@ -381,7 +420,6 @@ void executeCurrentDance() {
     Otto.sing(S_happy);
     modeActionInProgress = true;
     danceRoutines[currentDanceIndex]();
-    Otto.home();
     modeActionInProgress = false;
   }
 }
@@ -437,42 +475,51 @@ void handleMove(int code, int speed) {
     case 2: Otto.walk(steps, speed, -1); break;  // walk backwards
     case 3: Otto.turn(steps, speed, 1); break;   // turn left
     case 4: Otto.turn(steps, speed, -1); break;  // turn right
-    case 19: Otto.updown(1, 1000, 20); break;
-    case 8: Otto.tiptoeSwing(2, 1000, 30); break;
-    case 14: Otto.jitter(4, 500, 20); break;
-    case 20: Otto.ascendingTurn(2, 1000, 50); break;
-    case 5: Otto.jump(1, 500); break;
 
-    case 13: Otto.swing(2, 1000, 20); break;
-    case 7: Otto.crusaito(2, 1000, 20, 1); break;
-    case 17: Otto.flapping(2, 1000, 20, -1); break;
-    case 15: Otto.bend(1, 500, -1); break;
-    case 10: Otto.shakeLeg(2, 1000, -1); break;
+    case 19: Otto.jitter(1, 1000, 20); Otto.home(); break;
+    case 8: Otto.swing(2, 1000, 20); Otto.home(); break;
+    case 14: Otto.tiptoeSwing(2, 1000, 20); Otto.home(); break;
+    case 20: Otto.ascendingTurn(2, 1000, 50); Otto.home(); break;
+    case 5: Otto.updown(2, 1500, 20); Otto.home(); break;
 
-    case 12:
-      Otto.moonwalker(3, 1000, 25, 1);
-      Otto.moonwalker(3, 1000, 25, -1);
-      break;
-    case 6: Otto.crusaito(2, 1000, 20, -1); break;
-    case 18: Otto.flapping(2, 1000, 20, 1); break;
-    case 16: Otto.bend(1, 500, 1); break;
-    case 9: Otto.shakeLeg(2, 1000, 1); break;
+    case 13: Otto.flapping(2, 1000, 20, 1); Otto.home(); break;
+    case 7: Otto.moonwalker(3, 1000, 25, 1); Otto.home(); break;
+    case 17: Otto.shakeLeg(2, 1000, 1); Otto.home(); break;
+    case 15: Otto.bend(1, 500, 1); Otto.home(); break;
+    case 10: Otto.crusaito(2, 1000, 20, 1); Otto.home(); break;
+
+    case 12: Otto.flapping(2, 1000, 20, -1); Otto.home(); break;
+    case 6: Otto.moonwalker(3, 1000, 25, -1); Otto.home(); break;
+    case 18: Otto.shakeLeg(2, 1000, -1); Otto.home(); break;
+    case 16: Otto.bend(1, 500, -1); Otto.home(); break;
+    case 9: Otto.crusaito(2, 1000, 20, -1); Otto.home(); break;
 
     case 0: Otto.home(); break;  // Stop
     default:
-      // If the move code is not 1-4 or 0, maybe it's a gesture code sent with 'M'?
-      handleGesture(code);
+      Otto.home();
       break;
   }
 }
 
-void handleGesture(int code) {
-  Serial.printf("Handling Gesture: Code=%d\n", code);
+void handleSong(int code) {
+  Serial.printf("Handling Sound: Code=%d\n", code);
 
   switch (code) {
-    case 16: Otto.sing(S_mode1); break;
-    case 17: Otto.sing(S_mode2); break;
-    case 18: Otto.sing(S_mode3); break;
+    case 16:
+      {
+        executeSong(0);
+        break;
+      }
+    case 17:
+      {
+        executeSong(1);
+        break;
+      }
+    case 18:
+      {
+        executeSong(2);
+        break;
+      }
     case 4: Otto.sing(S_OhOoh); break;
     case 19: Otto.sing(S_buttonPushed); break;
 
@@ -494,24 +541,174 @@ void handleGesture(int code) {
   }
 }
 
-void handleSong(int code) {
+void handleGesture(int code) {
   Serial.printf("Handling Song: Code=%d\n", code);
 
   switch (code) {
-    case 1: Otto.playGesture(OttoHappy); break;
-    case 2: Otto.playGesture(OttoSuperHappy); break;
-    case 7: Otto.playGesture(OttoLove); break;
-    case 3: Otto.playGesture(OttoSad); break;
-    case 13: Otto.playGesture(OttoFail); break;
+    case 1:
+      Otto.playGesture(OttoHappy);
+      Otto.home();
+      break;
+    case 2:
+      Otto.playGesture(OttoSuperHappy);
+      Otto.home();
+      break;
+    case 7:
+      Otto.playGesture(OttoLove);
+      Otto.home();
+      break;
+    case 3:
+      Otto.playGesture(OttoSad);
+      Otto.home();
+      break;
+    case 13:
+      Otto.playGesture(OttoFail);
+      Otto.home();
+      break;
 
-    case 6: Otto.playGesture(OttoConfused); break;
-    case 5: Otto.playGesture(OttoVictory); break;
-    case 9: Otto.playGesture(OttoFretful); break;
-    case 8: Otto.playGesture(OttoAngry); break;
-    case 4: Otto.playGesture(OttoSleeping); break;
+    case 6:
+      Otto.playGesture(OttoConfused);
+      Otto.home();
+      break;
+    case 5:
+      Otto.playGesture(OttoVictory);
+      Otto.home();
+      break;
+    case 9:
+      Otto.playGesture(OttoFretful);
+      Otto.home();
+      break;
+    case 8:
+      Otto.playGesture(OttoAngry);
+      Otto.home();
+      break;
+    case 4:
+      Otto.playGesture(OttoSleeping);
+      Otto.home();
+      break;
 
-    case 10: Otto.playGesture(OttoWave); break;
-    case 12: Otto.playGesture(OttoMagic); break;
-    case 11: Otto.playGesture(OttoFart); break;
+    case 10:
+      Otto.playGesture(OttoWave);
+      Otto.home();
+      break;
+    case 12:
+      Otto.playGesture(OttoMagic);
+      Otto.home();
+      break;
+    case 11:
+      Otto.playGesture(OttoFart);
+      Otto.home();
+      break;
   }
+}
+
+std::vector<char*> songs = {
+  "Imperial:d=4,o=5,b=112:8g,16p,8g,16p,8g,16p,16d#.,32p,32a#.,8g,16p,16d#.,32p,32a#.,g,8p,32p,8d6,16p,8d6,16p,8d6,16p,16d#.6,32p,32a#.,8f#,16p,16d#.,32p,32a#.,g,8p,32p,8g6,16p,16g.,32p,32g.,8g6,16p,16f#.6,32p,32f.6,32e.6,32d#.6,16e6,8p,16g#,32p,8c#6,16p,16c.6,32p,32b.,32a#.,32a.,16a#,8p,16d#,32p,8f#,16p,16d#.,32p,32g.,8a#,16p,16g.,32p,32a#.,d6,8p,32p,8g6,16p,16g.,32p,32g.,8g6,16p,16f#.6,32p,32f.6,32e.6,32d#.6,16e6,8p,16g#,32p,8c#6,16p,16c.6,32p,32b.,32a#.,32a.,16a#,8p,16d#,32p,8f#,16p,16d#.,32p,32g.,8g,16p,16d#.,32p,32a#.,g",
+  "Indiana Jones:d=4,o=5,b=250:e,8p,8f,8g,8p,1c6,8p.,d,8p,8e,1f,p.,g,8p,8a,8b,8p,1f6,p,a,8p,8b,2c6,2d6,2e6,e,8p,8f,8g,8p,1c6,p,d6,8p,8e6,1f.6,g,8p,8g,e.6,8p,d6,8p,8g,e.6,8p,d6,8p,8g,f.6,8p,e6,8p,8d6,2c6",
+  "Spiderman:o=6,d=4,b=200,b=200:c,8d#,g.,p,f#,8d#,c.,p,c,8d#,g,8g#,g,f#,8d#,c.,p,f,8g#,c7.,p,a#,8g#,f.,p,c,8d#,g.,p,f#,8d#,c,p,8g#,2g,p,8f#,f#,8d#,f,8d#,2c"
+};
+
+void executeSong(int index) {
+  stopCurrentSong();   // stop nonblocking playback, LOW the pin
+  noTone(BUZZER_PIN);  // extra: kill anything leftover
+  Serial.println("Playing song");
+  anyrtttl::nonblocking::begin(BUZZER_PIN, songs[index]);
+}
+
+void stopCurrentSong() {
+  Serial.println("Stopping song");
+  anyrtttl::nonblocking::stop();
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void setupCalibration() {
+  // Initialize EEPROM
+  EEPROM.begin(16);
+
+  // Read trims from EEPROM
+  YL = EEPROM.read(0);
+  if (YL > 128) YL -= 256;
+  YR = EEPROM.read(1);
+  if (YR > 128) YR -= 256;
+  RL = EEPROM.read(2);
+  if (RL > 128) RL -= 256;
+  RR = EEPROM.read(3);
+  if (RR > 128) RR -= 256;
+  Otto.home();
+
+  // Apply trims and move to home
+  Otto.setTrims(YL, YR, RL, RR);
+  calib_homePos();
+
+  Serial.println("=== CALIBRATION SETTINGS ===");
+  Serial.println("a/z: Adjust Left Leg");
+  Serial.println("s/x: Adjust Left Foot");
+  Serial.println("k/m: Adjust Right Leg");
+  Serial.println("j/n: Adjust Right Foot");
+  Serial.println("r: Reset trims");
+  Serial.println("f: Walk test");
+  Serial.println("h: Go to home position");
+  Serial.println();
+  checkTrims();
+}
+
+void calibrationLoop() {
+  if (Serial.available()) {
+    char charRead = Serial.read();
+
+    switch (charRead) {
+      case 'a': YL++; break;
+      case 'z': YL++; break;
+      case 's': RL++; break;
+      case 'x': RL--; break;
+      case 'k': YR++; break;
+      case 'm': YR--; break;
+      case 'j': RR++; break;
+      case 'n': RR--; break;
+      case 'r': resetTrims(); return;
+      case 'f':
+        Otto.walk(1, 1000, 1);
+        Otto.detachServos();
+        return;
+
+      case 'h':
+        Otto.setTrims(YL, YR, RL, RR);
+        calib_homePos();
+        return;
+
+      default:
+        return;
+    }
+
+    Otto.setTrims(YL, YR, RL, RR);
+    calib_homePos();
+    Otto.saveTrimsOnEEPROM();
+    EEPROM.commit();
+    checkTrims();
+  }
+}
+
+void calib_homePos() {
+  int servoPos[4] = { 90, 90, 90, 90 };
+  Otto._moveServos(500, servoPos);
+  Otto.detachServos();
+}
+
+void checkTrims() {
+  Serial.print("Trims: ");
+  Serial.print(YL);
+  Serial.print(", ");
+  Serial.print(YR);
+  Serial.print(", ");
+  Serial.print(RL);
+  Serial.print(", ");
+  Serial.println(RR);
+}
+void resetTrims() {
+  // clear EEPROM in selected positions
+  EEPROM.write(0, 0);
+  EEPROM.write(1, 0);
+  EEPROM.write(2, 0);
+  EEPROM.write(3, 0);
+  EEPROM.commit();
 }
